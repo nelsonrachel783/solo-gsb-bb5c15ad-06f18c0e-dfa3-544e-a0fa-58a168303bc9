@@ -12,7 +12,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.responses import FileResponse, Response
 
 from .anonymizer import JobResult
-from . import consistency, dicomdir, merged_study, pagination, preview, study_subset
+from . import consistency, dicomdir, geometry, merged_study, pagination, preview, study_subset
 from .config import settings
 from .jobs import registry
 from .schemas import (
@@ -28,6 +28,8 @@ from .schemas import (
     MergedStudyErrorDetail,
     PatientOut,
     PreviewErrorDetail,
+    SeriesGeometryErrorDetail,
+    SeriesGeometryOut,
     SeriesOut,
     StudyOut,
     StudySubsetErrorDetail,
@@ -52,6 +54,8 @@ app = FastAPI(
         "支持按匿名检查下载子集、跨多个同密钥任务合并下载同一检查、"
         "生成带 DICOMDIR 的离线阅片 ZIP、"
         "按匿名 SOPInstanceUID 渲染单帧灰度 PNG 预览供人工核对，"
+        "按匿名 SeriesInstanceUID 检查单帧实例的几何完整性"
+        "（法线排序、相邻间距中位数与间隙异常标记），"
         "并支持对多个已完成任务做跨批次密钥指纹/伪名/UID 映射一致性核对。"
     ),
     lifespan=lifespan,
@@ -628,6 +632,52 @@ def download_instance_preview(job_id: str, sop_instance_uid: str) -> Response:
 
 
 @app.get(
+    "/jobs/{job_id}/series/{series_instance_uid}/geometry",
+    response_model=SeriesGeometryOut,
+    tags=["jobs"],
+    summary="检查某匿名系列单帧实例的几何完整性（法线排序、相邻间距中位数与间隙异常）",
+    responses={
+        404: {"model": SeriesGeometryErrorDetail,
+              "description": "任务不存在/已过期，或该匿名系列不在任务的成功输出中"},
+        409: {"model": SeriesGeometryErrorDetail,
+              "description": "任务未完成、系列成功输出均为多帧实例，或几何冲突"
+                             "（方向不一致 / FrameOfReferenceUID 不同 / 几何标签无效 / "
+                             "投影位置重合）"},
+        500: {"model": SeriesGeometryErrorDetail,
+              "description": "匿名输出文件不可读或已丢失"},
+    },
+)
+def get_series_geometry(job_id: str, series_instance_uid: str) -> SeriesGeometryOut:
+    job = registry.get(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "JOB_NOT_FOUND",
+                "message": "任务不存在或已过期",
+                "series_instance_uid": series_instance_uid,
+            },
+        )
+    if job.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "JOB_NOT_READY",
+                "message": f"任务处理失败：{job.error}",
+                "series_instance_uid": series_instance_uid,
+            },
+        )
+
+    try:
+        report = geometry.analyze_series_geometry(job, series_instance_uid)
+    except geometry.GeometryError as exc:
+        raise HTTPException(
+            status_code=exc.http_status, detail=exc.detail
+        ) from exc
+    return SeriesGeometryOut.model_validate(report)
+
+
+@app.get(
     "/jobs/{job_id}/dicomdir/download",
     tags=["jobs"],
     summary="下载带 DICOMDIR 的离线阅片 ZIP（按匿名伪名/UID 重建患者-检查-系列-实例层级）",
@@ -687,6 +737,7 @@ def root() -> dict:
             "GET /jobs/{job_id}/download",
             "GET /jobs/{job_id}/dicomdir/download",
             "GET /jobs/{job_id}/studies/{study_instance_uid}/download",
+            "GET /jobs/{job_id}/series/{series_instance_uid}/geometry",
             "GET /jobs/{job_id}/instances/{sop_instance_uid}/preview.png",
             "GET /health",
         ],

@@ -76,6 +76,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/jobs/{job_id}/download` | 下载匿名化后的 ZIP（全量） |
 | `GET` | `/jobs/{job_id}/dicomdir/download` | 下载带 **DICOMDIR** 的离线阅片 ZIP：按匿名伪名 / Study/Series/SOP UID 重建四级目录层级，实例映射为合规稳定短 File ID |
 | `GET` | `/jobs/{job_id}/studies/{study_instance_uid}/download` | 按**匿名 StudyInstanceUID** 下载检查子集（递归补全 SOP 引用闭包，含跨检查引用） |
+| `GET` | `/jobs/{job_id}/series/{series_instance_uid}/geometry` | 检查某**匿名系列**单帧实例的几何完整性：叉积法线排序、相邻投影间距中位数基准、标记 > 1.5 倍中位数的间隙；方向/坐标系/标签/位置冲突返回 `409` 明细 |
 | `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/preview.png` | 按**匿名 SOPInstanceUID** 返回实例影像的 8 位灰度 **PNG 预览**（未压缩、单帧、8/16 位 MONOCHROME1/2），供人工核对影像内容 |
 | `GET` | `/health` | 健康检查 |
 
@@ -382,6 +383,110 @@ else:
 > 注意：预览只做线性 Modality LUT + 线性 VOI 窗，**不应用** Presentation LUT、
 > 不应用 LUTData、不做几何变换（不缩放、不旋转、不叠加任何标注），目的仅为快速
 > 人工核对影像内容；需要诊断级阅片请下载匿名 ZIP / DICOMDIR 包用专业阅片软件打开。
+
+### 系列几何完整性检查（`GET /jobs/{job_id}/series/{series_instance_uid}/geometry`）
+
+匿名化完成后、导入 PACS 前，可按**匿名 SeriesInstanceUID** 检查该系列单帧实例的
+**切片几何是否完整一致**（丢片 / 重复位置 / 方向混杂 / 坐标系混杂）。数据**只来自
+已完成任务 output 目录中的匿名 DICOM 文件**（`stop_before_pixels`，只读标签不读
+像素），不重新解压或处理原始 ZIP。
+
+`series_instance_uid` 必须是任务结果中的**匿名后** UID，取自 `GET /jobs/{id}`
+响应里的 `series[].new_series_instance_uid`（或某文件的 `series_instance_uid`）。
+
+**分析口径**：
+
+1. 只取该系列**成功写出**的匿名输出中的**单帧**实例（`NumberOfFrames` 缺省或为 1；
+   多帧实例不参与分析，仅在 `skipped_multiframe_count` 中计数）；
+2. 对每个单帧实例读取 `ImageOrientationPatient`（6 个方向余弦），以**行/列方向余弦
+   叉积**求法线并单位化；把 `ImagePositionPatient` **投影到法线**得到切片位置，
+   按投影坐标**升序排序**；
+3. 全部实例的 `FrameOfReferenceUID` 必须相同、法线方向必须一致（单位法线点差
+   容差约 2.6°，反向法线同样视为不一致），几何标签必须有效，投影位置不得重合
+   （相邻差 < 0.001 mm 视为重合）——任一不满足即返回 `409` 冲突明细（见下表）；
+4. 方向一致时，以**相邻投影间距的中位数**为基准，标记**大于 1.5 倍中位数**的
+   间隙（`anomaly_indices` / `gaps`）；单帧实例**不足 3 张**时无法以中位数判断
+   间隙，`gap_analysis_possible=false` 并在 `gap_note` 中注明（排序与相邻间距
+   仍然给出）。
+
+**成功响应（200）**主要字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `frame_of_reference_uid` | 全系列一致的匿名 FrameOfReferenceUID |
+| `instance_count` / `skipped_multiframe_count` | 参与分析的单帧实例数 / 被排除的多帧实例数 |
+| `row_direction` / `column_direction` / `normal` | 方向余弦与叉积单位法线（3 分量） |
+| `instances[]` | 按投影升序：`index`、`sop_instance_uid`（匿名）、`projection`（mm）、`spacing_to_next`（mm，末张为 `null`） |
+| `median_spacing` / `gap_threshold` | 相邻间距中位数（mm）/ 间隙阈值 = 1.5 × 中位数 |
+| `anomaly_indices` | 超过阈值的相邻间距下标（对应 `instances` 下标） |
+| `gaps[]` | 间隙明细：`index`、`spacing`、`ratio`（间距/中位数）、`before/after_sop_instance_uid` |
+| `gap_analysis_possible` / `gap_note` | 是否可判断间隙；不足 3 张时 `gap_note` 说明原因 |
+
+**错误响应**（`detail.code` 机器可读）：
+
+| 状态码 | `detail.code` | 触发条件 |
+| --- | --- | --- |
+| `404` | `JOB_NOT_FOUND` | 任务 ID 不存在或已过期 |
+| `404` | `SERIES_NOT_FOUND` | 该匿名 SeriesInstanceUID 不在任务的成功输出中 |
+| `409` | `JOB_NOT_READY` | 任务 `status != ready`（匿名化处理失败） |
+| `409` | `NO_SINGLE_FRAME_INSTANCES` | 系列成功输出均为多帧实例，无单帧实例可分析 |
+| `409` | `GEOMETRY_CONFLICT` | 几何冲突；`detail.conflicts[]` 一次性列出全部冲突（见下） |
+| `500` | `ANONYMIZED_OUTPUT_UNREADABLE` | 匿名输出文件不可读或已丢失 |
+
+`GEOMETRY_CONFLICT` 的 `conflicts[]` 按 `code` 区分，均附涉及的**匿名
+SOPInstanceUID**：
+
+| `conflicts[].code` | 含义 | 明细字段 |
+| --- | --- | --- |
+| `INVALID_GEOMETRY_TAGS` | 几何标签缺失/无效 | `invalid_instances[]`：逐实例 `reasons`（`missing_frame_of_reference_uid` / `missing_image_orientation_patient` / `invalid_image_orientation_patient` / `missing_image_position_patient` / `invalid_image_position_patient` / `degenerate_orientation`） |
+| `FRAME_OF_REFERENCE_MISMATCH` | 实例分属不同 FrameOfReferenceUID | `frame_of_reference_groups[]`：按坐标系分组的匿名 SOP UID |
+| `ORIENTATION_INCONSISTENT` | 方向余弦法线不一致（含反向） | `orientations[]`：逐实例行/列方向余弦与法线 |
+| `DUPLICATE_POSITION` | 投影位置重合（相邻差 < 0.001 mm） | `duplicate_positions[]`：重合投影坐标与匿名 SOP UID 组 |
+
+```bash
+# 7) 取某个匿名 SeriesInstanceUID，检查该系列切片几何
+SERIES_UID=$(python3 -c "import json;print(json.load(open('job.json'))['series'][0]['new_series_instance_uid'])")
+
+curl -s "http://localhost:8000/jobs/$JOB_ID/series/$SERIES_UID/geometry" | python3 -m json.tool
+# {
+#   "instance_count": 4,
+#   "normal": [0.0, 0.0, 1.0],
+#   "median_spacing": 5.0,
+#   "gap_threshold": 7.5,
+#   "gap_analysis_possible": true,
+#   "instances": [
+#     {"index": 0, "sop_instance_uid": "2.25.…", "projection": 0.0,  "spacing_to_next": 5.0},
+#     {"index": 1, "sop_instance_uid": "2.25.…", "projection": 5.0,  "spacing_to_next": 5.0},
+#     {"index": 2, "sop_instance_uid": "2.25.…", "projection": 10.0, "spacing_to_next": 20.0},
+#     {"index": 3, "sop_instance_uid": "2.25.…", "projection": 30.0, "spacing_to_next": null}
+#   ],
+#   "anomaly_indices": [2],
+#   "gaps": [{"index": 2, "spacing": 20.0, "ratio": 4.0,
+#             "before_sop_instance_uid": "2.25.…", "after_sop_instance_uid": "2.25.…"}]
+# }
+```
+
+Python 示例（含 404/409 处理）：
+
+```python
+resp = requests.get(
+    f"http://localhost:8000/jobs/{job_id}/series/{series_uid}/geometry"
+)
+if resp.status_code == 404:
+    print("任务或匿名系列不存在：", resp.json()["detail"]["code"])
+elif resp.status_code == 409:
+    detail = resp.json()["detail"]
+    print("无法完成几何检查：", detail["code"])   # JOB_NOT_READY / NO_SINGLE_FRAME_INSTANCES / GEOMETRY_CONFLICT
+    for c in detail.get("conflicts", []):
+        print("冲突：", c["code"], c["sop_instance_uids"])
+else:
+    resp.raise_for_status()
+    body = resp.json()
+    if not body["gap_analysis_possible"]:
+        print(body["gap_note"])
+    for gap in body["gaps"]:
+        print("间隙：", gap["spacing"], "mm，位于", gap["before_sop_instance_uid"], "之后")
+```
 
 ### 跨任务合并下载同一匿名检查（`POST /jobs/merged-study/download`）
 
@@ -921,9 +1026,10 @@ else:
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集下载、实例 PNG 预览、/health）
+│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集下载、系列几何检查、实例 PNG 预览、/health）
 │   ├── anonymizer.py    # 两遍扫描引擎：UID 映射、标签重写、递归序列、诊断、ZIP 打包
 │   ├── preview.py       # 按匿名 SOP UID 从成功输出渲染单帧 8 位灰度 PNG：Rescale→VOI 窗/极值拉伸→MONOCHROME1 反相
+│   ├── geometry.py      # 按匿名 SeriesInstanceUID 检查单帧实例几何：叉积法线排序、间距中位数间隙标记、方向/坐标系/标签/位置冲突
 │   ├── dicomdir.py      # 从匿名输出重建 DICOMDIR 四级层级、稳定短 File ID、引用校验与阅片 ZIP
 │   ├── study_subset.py  # 按匿名 StudyInstanceUID 的引用闭包解析与子集 ZIP（复用匿名输出）
 │   ├── merged_study.py  # 跨 2～5 个同密钥任务的检查合并：跨任务引用闭包、字节去重/冲突/缺失 409
@@ -932,9 +1038,9 @@ else:
 │   ├── crypto.py        # HMAC 确定性派生：伪名、UID、日期偏移
 │   ├── tags.py          # Annex E 标签策略与参与一致性重写的 UID 标签集合
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
-│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR/预览错误模型）
+│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR/预览/几何错误模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览（174 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何（198 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

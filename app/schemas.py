@@ -503,3 +503,143 @@ class MergedStudyErrorDetail(BaseModel):
         default=[],
         description="引用目标在所有指定任务成功输出中均不存在的匿名 UID 列表",
     )
+
+
+# --------------------------------------------------------------------------- #
+# 系列几何完整性检查（GET /jobs/{id}/series/{uid}/geometry）
+# --------------------------------------------------------------------------- #
+class GeometryInstanceOut(BaseModel):
+    index: int = Field(description="按投影坐标升序排序后的序号（0 起）")
+    sop_instance_uid: str = Field(description="匿名 SOPInstanceUID")
+    projection: float = Field(
+        description="ImagePositionPatient 在系列法线上的投影坐标（mm）"
+    )
+    spacing_to_next: Optional[float] = Field(
+        default=None, description="与下一张实例的投影间距（mm）；最后一张为 null"
+    )
+
+
+class GeometryGapOut(BaseModel):
+    index: int = Field(
+        description="间隙位置：instances[index] 与 instances[index+1] 之间"
+    )
+    spacing: float = Field(description="该相邻投影间距（mm）")
+    ratio: float = Field(description="spacing / median_spacing")
+    before_sop_instance_uid: str = Field(description="间隙前一实例的匿名 SOPInstanceUID")
+    after_sop_instance_uid: str = Field(description="间隙后一实例的匿名 SOPInstanceUID")
+
+
+class SeriesGeometryOut(BaseModel):
+    job_id: str
+    series_instance_uid: str = Field(description="匿名 SeriesInstanceUID")
+    study_instance_uid: Optional[str] = Field(
+        default=None, description="所属匿名 StudyInstanceUID"
+    )
+    frame_of_reference_uid: str = Field(
+        description="全系列一致的匿名 FrameOfReferenceUID"
+    )
+    instance_count: int = Field(description="参与几何分析的单帧实例数")
+    skipped_multiframe_count: int = Field(
+        description="被排除的多帧实例数（不参与几何分析）"
+    )
+    row_direction: list[float] = Field(
+        description="ImageOrientationPatient 行方向余弦（3 分量）"
+    )
+    column_direction: list[float] = Field(
+        description="ImageOrientationPatient 列方向余弦（3 分量）"
+    )
+    normal: list[float] = Field(
+        description="行/列方向余弦叉积得到的单位法线（3 分量）"
+    )
+    median_spacing: Optional[float] = Field(
+        default=None,
+        description="相邻投影间距的中位数（mm）；单帧实例不足 3 张时为 null",
+    )
+    gap_threshold: Optional[float] = Field(
+        default=None,
+        description="间隙阈值 = 1.5 × median_spacing；单帧实例不足 3 张时为 null",
+    )
+    gap_analysis_possible: bool = Field(
+        description="单帧实例是否 >= 3 张、可以判断间隙"
+    )
+    gap_note: Optional[str] = Field(
+        default=None, description="gap_analysis_possible=false 时说明无法判断间隙"
+    )
+    instances: list[GeometryInstanceOut] = Field(
+        description="按投影坐标升序的实例列表（匿名 SOP UID / 投影 / 相邻间距）"
+    )
+    anomaly_indices: list[int] = Field(
+        description="超过间隙阈值的相邻间距下标（对应 instances 下标）"
+    )
+    gaps: list[GeometryGapOut] = Field(description="间隙明细")
+
+
+class GeometryInvalidInstance(BaseModel):
+    sop_instance_uid: str = Field(description="匿名 SOPInstanceUID")
+    output_file: str = Field(description="任务 output 目录内的扁平匿名文件名")
+    reasons: list[str] = Field(
+        description="missing_frame_of_reference_uid | "
+        "missing_image_orientation_patient | invalid_image_orientation_patient | "
+        "missing_image_position_patient | invalid_image_position_patient | "
+        "degenerate_orientation"
+    )
+    message: str
+
+
+class GeometryFrameOfReferenceGroup(BaseModel):
+    frame_of_reference_uid: str = Field(description="匿名 FrameOfReferenceUID")
+    sop_instance_uids: list[str] = Field(
+        description="属于该坐标系的匿名 SOPInstanceUID"
+    )
+
+
+class GeometryOrientationEntry(BaseModel):
+    sop_instance_uid: str = Field(description="匿名 SOPInstanceUID")
+    row_direction: list[float]
+    column_direction: list[float]
+    normal: list[float] = Field(description="由方向余弦叉积得到的单位法线")
+
+
+class GeometryDuplicatePosition(BaseModel):
+    projection: float = Field(description="重合位置的法线投影坐标（mm）")
+    sop_instance_uids: list[str] = Field(
+        description="投影到该位置（相互差小于容差）的匿名 SOPInstanceUID"
+    )
+
+
+class GeometryConflictItem(BaseModel):
+    code: str = Field(
+        description="INVALID_GEOMETRY_TAGS（几何标签缺失/无效） | "
+        "FRAME_OF_REFERENCE_MISMATCH（FrameOfReferenceUID 不一致） | "
+        "ORIENTATION_INCONSISTENT（方向余弦法线不一致） | "
+        "DUPLICATE_POSITION（投影位置重合）"
+    )
+    message: str
+    sop_instance_uids: list[str] = Field(
+        description="涉及该冲突的匿名 SOPInstanceUID"
+    )
+    invalid_instances: list[GeometryInvalidInstance] = Field(
+        default=[], description="code=INVALID_GEOMETRY_TAGS 时逐实例给出原因"
+    )
+    frame_of_reference_groups: list[GeometryFrameOfReferenceGroup] = Field(
+        default=[], description="code=FRAME_OF_REFERENCE_MISMATCH 时按坐标系分组"
+    )
+    orientations: list[GeometryOrientationEntry] = Field(
+        default=[], description="code=ORIENTATION_INCONSISTENT 时逐实例给出法线"
+    )
+    duplicate_positions: list[GeometryDuplicatePosition] = Field(
+        default=[], description="code=DUPLICATE_POSITION 时按重合位置分组"
+    )
+
+
+class SeriesGeometryErrorDetail(BaseModel):
+    code: str = Field(
+        description="JOB_NOT_FOUND（404） | SERIES_NOT_FOUND（404） | "
+        "JOB_NOT_READY（409） | NO_SINGLE_FRAME_INSTANCES（409） | "
+        "GEOMETRY_CONFLICT（409） | ANONYMIZED_OUTPUT_UNREADABLE（500）"
+    )
+    message: str
+    series_instance_uid: Optional[str] = None
+    conflicts: list[GeometryConflictItem] = Field(
+        default=[], description="code=GEOMETRY_CONFLICT 时一次性列出全部冲突明细"
+    )
