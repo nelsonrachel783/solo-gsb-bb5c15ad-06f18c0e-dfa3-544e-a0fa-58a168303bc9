@@ -12,7 +12,15 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.responses import FileResponse, Response
 
 from .anonymizer import JobResult
-from . import consistency, dicomdir, merged_study, pagination, preview, study_subset
+from . import (
+    consistency,
+    dicomdir,
+    geometry,
+    merged_study,
+    pagination,
+    preview,
+    study_subset,
+)
 from .config import settings
 from .jobs import registry
 from .schemas import (
@@ -23,11 +31,13 @@ from .schemas import (
     CursorErrorDetail,
     DicomDirErrorDetail,
     FileOut,
+    GeometryErrorDetail,
     JobOut,
     MergedStudyDownloadRequest,
     MergedStudyErrorDetail,
     PatientOut,
     PreviewErrorDetail,
+    SeriesGeometryOut,
     SeriesOut,
     StudyOut,
     StudySubsetErrorDetail,
@@ -562,6 +572,52 @@ def _safe_unlink(path: str) -> None:
 
 
 @app.get(
+    "/jobs/{job_id}/series/{series_instance_uid}/geometry",
+    response_model=SeriesGeometryOut,
+    tags=["jobs"],
+    summary=(
+        "按匿名 SeriesInstanceUID 分析单帧切片几何：方向法线投影排序、"
+        "中位数层间距与异常缺口标记"
+    ),
+    responses={
+        404: {"model": GeometryErrorDetail,
+              "description": "任务不存在/已过期，或该匿名系列不在任务的成功输出中"},
+        409: {"model": GeometryErrorDetail,
+              "description": "任务未完成，或系列几何冲突：FrameOfReferenceUID 不一致、"
+                             "ImageOrientationPatient 方向不一致、几何标签无效、"
+                             "投影位置重合、SOP 输出歧义/不可读"},
+    },
+)
+def get_series_geometry(job_id: str, series_instance_uid: str) -> SeriesGeometryOut:
+    job = registry.get(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "JOB_NOT_FOUND",
+                "message": "任务不存在或已过期",
+                "series_instance_uid": series_instance_uid,
+            },
+        )
+    if job.status != "ready":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "JOB_NOT_READY",
+                "message": f"任务处理失败：{job.error}",
+                "series_instance_uid": series_instance_uid,
+            },
+        )
+
+    try:
+        report = geometry.analyze_series_geometry(job, series_instance_uid)
+    except geometry.GeometryError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.detail) from exc
+
+    return SeriesGeometryOut.model_validate(report)
+
+
+@app.get(
     "/jobs/{job_id}/instances/{sop_instance_uid}/preview.png",
     tags=["jobs"],
     response_class=Response,
@@ -687,6 +743,7 @@ def root() -> dict:
             "GET /jobs/{job_id}/download",
             "GET /jobs/{job_id}/dicomdir/download",
             "GET /jobs/{job_id}/studies/{study_instance_uid}/download",
+            "GET /jobs/{job_id}/series/{series_instance_uid}/geometry",
             "GET /jobs/{job_id}/instances/{sop_instance_uid}/preview.png",
             "GET /health",
         ],

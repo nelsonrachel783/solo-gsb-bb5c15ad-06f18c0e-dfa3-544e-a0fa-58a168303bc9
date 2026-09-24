@@ -423,6 +423,160 @@ class DicomDirErrorDetail(BaseModel):
     problems: list[DicomDirProblemItem] = []
 
 
+class GeometrySliceItem(BaseModel):
+    index: int = Field(description="按法线投影升序排列后的 0 基序号")
+    sop_instance_uid: str = Field(description="该切片的匿名 SOPInstanceUID")
+    projection: float = Field(
+        description="ImagePositionPatient 在平面单位法线上的标量投影（毫米）"
+    )
+    image_position_patient: list[float] = Field(
+        description="匿名文件中的 ImagePositionPatient（x/y/z，毫米）"
+    )
+
+
+class GeometrySpacingItem(BaseModel):
+    index: int = Field(
+        description="相邻间隙的 0 基序号（spacings[i] 连接 slices[i] 与 slices[i+1]）"
+    )
+    from_sop_instance_uid: str
+    to_sop_instance_uid: str
+    distance: float = Field(description="相邻切片沿法线的投影距离（毫米，恒为非负）")
+    anomalous: bool = Field(description="该距离是否大于 1.5 × 中位数间距")
+
+
+class GeometryExcludedItem(BaseModel):
+    sop_instance_uid: str = Field(description="被排除实例的匿名 SOPInstanceUID")
+    output_file: Optional[str] = Field(
+        default=None, description="任务 output 目录内的扁平文件名"
+    )
+    reason: str = Field(description="multiframe（NumberOfFrames 显式 >1 或非法）")
+    number_of_frames: Optional[str] = Field(
+        default=None, description="文件中 NumberOfFrames 的原始文本"
+    )
+    message: str
+
+
+class SeriesGeometryOut(BaseModel):
+    series_instance_uid: str = Field(description="请求的匿名 SeriesInstanceUID")
+    frame_of_reference_uid: str = Field(
+        description="系列内统一的匿名 FrameOfReferenceUID"
+    )
+    image_orientation_patient: list[float] = Field(
+        description="系列基准方向：行/列方向余弦（6 分量，单位向量）"
+    )
+    normal: list[float] = Field(
+        description="行方向 × 列方向叉积得到的单位法线（3 分量）"
+    )
+    instance_count: int = Field(description="参与排序的有效单帧实例数")
+    gap_check: str = Field(
+        description="ok（已完成中位数缺口判定） | "
+        "insufficient_slices（有效单帧实例不足 3 张，无法判断间隙）"
+    )
+    median_spacing: Optional[float] = Field(
+        default=None,
+        description="相邻投影距离的中位数（毫米）；insufficient_slices 时为 null",
+    )
+    gap_factor: float = Field(description="缺口阈值倍数，固定 1.5")
+    anomalous_gap_indices: list[int] = Field(
+        description="大于 1.5 × 中位数间距的相邻间隙序号（spacings[].index）"
+    )
+    slices: list[GeometrySliceItem] = Field(
+        description="按法线投影升序排列的匿名 SOP UID 与投影坐标"
+    )
+    spacings: list[GeometrySpacingItem] = Field(
+        description="排序后逐对相邻切片的间距（slices[i] -> slices[i+1]）"
+    )
+    message: Optional[str] = Field(
+        default=None, description="insufficient_slices 时给出无法判断间隙的说明"
+    )
+    excluded_instances: list[GeometryExcludedItem] = Field(
+        default=[],
+        description="系列成功输出中未参与几何分析的实例（多帧实例）",
+    )
+
+
+class GeometryProblemItem(BaseModel):
+    sop_instance_uid: Optional[str] = Field(
+        default=None, description="出问题实例的匿名 SOPInstanceUID（歧义时为该共同 UID）"
+    )
+    sop_instance_uids: list[str] = Field(
+        default=[],
+        description=(
+            "frame_of_reference_mismatch / orientation_mismatch / "
+            "duplicate_projection 时给出同组全部匿名 SOP UID"
+        ),
+    )
+    output_file: Optional[str] = Field(
+        default=None, description="可定位时给出任务 output 目录内的扁平文件名"
+    )
+    output_files: list[str] = Field(
+        default=[], description="ambiguous_output 时给出相互冲突的输出文件名"
+    )
+    reason: str = Field(
+        description=(
+            "invalid_geometry（几何标签缺失/无法解析/取值非法） | "
+            "frame_of_reference_mismatch（FrameOfReferenceUID 不一致） | "
+            "orientation_mismatch（ImageOrientationPatient 方向不一致） | "
+            "duplicate_projection（法线投影位置重合） | "
+            "ambiguous_output（同一匿名 SOP UID 对应多份输出） | "
+            "unreadable（匿名输出不可读） | output_missing（磁盘文件缺失）"
+        )
+    )
+    missing_or_invalid_tags: list[str] = Field(
+        default=[], description="reason=invalid_geometry 时给出缺失的标签关键字"
+    )
+    frame_of_reference_uid: Optional[str] = Field(
+        default=None, description="frame_of_reference_mismatch 时该组的 FrameOfReferenceUID"
+    )
+    expected_frame_of_reference_uid: Optional[str] = Field(
+        default=None, description="frame_of_reference_mismatch 时的系列基准 UID"
+    )
+    image_orientation_patient: Optional[list[float]] = Field(
+        default=None, description="orientation_mismatch 时该组实际方向余弦（6 分量）"
+    )
+    expected_image_orientation_patient: Optional[list[float]] = Field(
+        default=None, description="orientation_mismatch 时的系列基准方向余弦"
+    )
+    normal: Optional[list[float]] = Field(
+        default=None, description="orientation_mismatch 时该组叉积单位法线"
+    )
+    expected_normal: Optional[list[float]] = Field(
+        default=None, description="orientation_mismatch 时的系列基准法线"
+    )
+    opposite_direction: Optional[bool] = Field(
+        default=None,
+        description=(
+            "orientation_mismatch 时该组法线是否与系列基准法线反向"
+            "（normal·expected_normal ≈ -1，即从相反一侧观察、投影排序方向相反）；"
+            "绕法线旋转 180°（行/列同时反向、法线不变）时为 false"
+        ),
+    )
+    projection: Optional[float] = Field(
+        default=None, description="duplicate_projection 时的重合投影坐标（毫米）"
+    )
+    positions: list[dict] = Field(
+        default=[],
+        description="duplicate_projection 时给出各匿名 SOP UID 及其投影坐标",
+    )
+    message: str
+
+
+class GeometryErrorDetail(BaseModel):
+    code: str = Field(
+        description="SERIES_NOT_FOUND（404） | JOB_NOT_READY（409） | "
+        "SERIES_GEOMETRY_CONFLICT（409） | NO_SINGLE_FRAME_INSTANCES（409）"
+    )
+    message: str
+    series_instance_uid: Optional[str] = None
+    single_frame_instance_count: Optional[int] = Field(
+        default=None, description="SERIES_GEOMETRY_CONFLICT 时已解析的单帧实例数"
+    )
+    conflict_count: Optional[int] = Field(
+        default=None, description="SERIES_GEOMETRY_CONFLICT 时的冲突明细条数"
+    )
+    problems: list[GeometryProblemItem] = []
+
+
 # --------------------------------------------------------------------------- #
 # 跨任务合并下载单个匿名检查（POST /jobs/merged-study/download）
 # --------------------------------------------------------------------------- #

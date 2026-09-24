@@ -76,6 +76,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/jobs/{job_id}/download` | 下载匿名化后的 ZIP（全量） |
 | `GET` | `/jobs/{job_id}/dicomdir/download` | 下载带 **DICOMDIR** 的离线阅片 ZIP：按匿名伪名 / Study/Series/SOP UID 重建四级目录层级，实例映射为合规稳定短 File ID |
 | `GET` | `/jobs/{job_id}/studies/{study_instance_uid}/download` | 按**匿名 StudyInstanceUID** 下载检查子集（递归补全 SOP 引用闭包，含跨检查引用） |
+| `GET` | `/jobs/{job_id}/series/{series_instance_uid}/geometry` | 按**匿名 SeriesInstanceUID** 分析单帧切片几何：方向余弦叉积法线、投影排序、中位数层间距与 `>1.5×` 异常缺口标记，冲突时返回含匿名 SOP UID 的明细 |
 | `GET` | `/jobs/{job_id}/instances/{sop_instance_uid}/preview.png` | 按**匿名 SOPInstanceUID** 返回实例影像的 8 位灰度 **PNG 预览**（未压缩、单帧、8/16 位 MONOCHROME1/2），供人工核对影像内容 |
 | `GET` | `/health` | 健康检查 |
 
@@ -382,6 +383,144 @@ else:
 > 注意：预览只做线性 Modality LUT + 线性 VOI 窗，**不应用** Presentation LUT、
 > 不应用 LUTData、不做几何变换（不缩放、不旋转、不叠加任何标注），目的仅为快速
 > 人工核对影像内容；需要诊断级阅片请下载匿名 ZIP / DICOMDIR 包用专业阅片软件打开。
+
+### 系列切片几何分析（`GET /jobs/{job_id}/series/{series_instance_uid}/geometry`）
+
+匿名化后导入 PACS / 重建前，如需检查一个断层系列的**层方向是否一致、切片是否
+按几何位置有序排列、是否存在异常层间距（漏层/重层）**，可按**匿名
+SeriesInstanceUID** 取回该系列的几何分析结果。数据**只来自已完成任务 output
+目录中的匿名 DICOM 文件**，不重新解压或处理原始 ZIP，且**只纳入成功写出的
+单帧实例**（`NumberOfFrames` 缺省或为 1；多帧实例不参与分析，在
+`excluded_instances` 中单独列出）。
+
+`series_instance_uid` 必须是任务结果中的**匿名后** UID，取自 `GET /jobs/{id}`
+响应里的 `series[].new_series_instance_uid`（或某文件的 `series_instance_uid`）。
+
+**分析算法**：
+
+1. 读取每个单帧实例的 `ImageOrientationPatient`（行、列方向余弦，各 3 分量）与
+   `ImagePositionPatient`（片层坐标，毫米）；
+2. 校验方向余弦为有限值、分量在 `[-1, 1]` 内、行/列向量非零且近似正交，再做
+   单位化并求叉积法线 ``n = row × col``；
+3. 把各实例位置投影到法线：``p = ImagePositionPatient · n``，按 `p` **升序**
+   排列切片；
+4. 计算排序后逐对相邻投影距离，以其**中位数**为基准间距，把
+   **`distance > 1.5 × median`** 的相邻间隙标记为异常缺口（严格大于；恰好等于
+   1.5 倍不算）；
+5. 有效单帧实例**不足 3 张**（相邻间距不足 2 个）时 `gap_check` 返回
+   `insufficient_slices`，`median_spacing` / `anomalous_gap_indices` 为空，
+   并在 `message` 中注明无法判断间隙；其余情况 `gap_check=ok`。
+
+成功响应（200）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `frame_of_reference_uid` | 系列内统一的匿名 FrameOfReferenceUID |
+| `image_orientation_patient` | 系列基准方向余弦（6 分量，已单位化） |
+| `normal` | 行 × 列叉积得到的单位法线（3 分量） |
+| `instance_count` | 参与排序的有效单帧实例数 |
+| `gap_check` | `ok` / `insufficient_slices` |
+| `median_spacing` | 相邻投影距离中位数（毫米）；不足 3 张时为 `null` |
+| `gap_factor` | 缺口阈值倍数，固定 `1.5` |
+| `anomalous_gap_indices` | 异常间隙序号列表（对应 `spacings[].index`） |
+| `slices[]` | 排序后的 `index` / 匿名 `sop_instance_uid` / `projection` / `image_position_patient` |
+| `spacings[]` | 逐对相邻切片：`index`、`from/to_sop_instance_uid`、`distance`（毫米）、`anomalous` |
+| `excluded_instances[]` | 未参与分析的实例（`reason=multiframe`，附 `number_of_frames`） |
+| `message` | `insufficient_slices` 时的说明，正常时为 `null` |
+
+```bash
+# 7) 取某个匿名 SeriesInstanceUID，查看投影排序与异常层间距
+SERIES_UID=$(python3 -c "import json;print(json.load(open('job.json'))['series'][0]['new_series_instance_uid'])")
+
+curl -f "http://localhost:8000/jobs/$JOB_ID/series/$SERIES_UID/geometry" | python3 -m json.tool
+```
+
+```jsonc
+{
+  "series_instance_uid": "2.25.1695…",
+  "frame_of_reference_uid": "2.25.4467…",
+  "image_orientation_patient": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+  "normal": [0.0, 0.0, 1.0],                 // 轴位：法线 +Z
+  "instance_count": 4,
+  "gap_check": "ok",
+  "median_spacing": 5.0,
+  "gap_factor": 1.5,
+  "anomalous_gap_indices": [2],              // 第 3 个间隙 20mm > 7.5mm
+  "slices": [
+    {"index": 0, "sop_instance_uid": "2.25.1528…", "projection": 0.0,
+     "image_position_patient": [10.0, -20.0, 0.0]},
+    {"index": 1, "sop_instance_uid": "2.25.3174…", "projection": 5.0,
+     "image_position_patient": [10.0, -20.0, 5.0]},
+    {"index": 2, "sop_instance_uid": "2.25.3258…", "projection": 10.0,
+     "image_position_patient": [10.0, -20.0, 10.0]},
+    {"index": 3, "sop_instance_uid": "2.25.2030…", "projection": 30.0,
+     "image_position_patient": [10.0, -20.0, 30.0]}
+  ],
+  "spacings": [
+    {"index": 0, "from_sop_instance_uid": "2.25.1528…", "to_sop_instance_uid": "2.25.3174…",
+     "distance": 5.0, "anomalous": false},
+    {"index": 1, "from_sop_instance_uid": "2.25.3174…", "to_sop_instance_uid": "2.25.3258…",
+     "distance": 5.0, "anomalous": false},
+    {"index": 2, "from_sop_instance_uid": "2.25.3258…", "to_sop_instance_uid": "2.25.2030…",
+     "distance": 20.0, "anomalous": true}
+  ],
+  "message": null,
+  "excluded_instances": []
+}
+```
+
+出现以下任一情况时接口**不返回不可靠的排序结果**，而是返回 `409`
+（`detail.code = SERIES_GEOMETRY_CONFLICT`），在 `detail.problems[]` 中
+**一次性列出全部冲突，且每条都带匿名 SOP UID**（绝不回显原始 UID）：
+
+| `reason` | 触发条件 |
+| --- | --- |
+| `frame_of_reference_mismatch` | 系列内 `FrameOfReferenceUID` 不一致（分组给出各组匿名 SOP UID、本组与基准 Frame UID） |
+| `orientation_mismatch` | `ImageOrientationPatient` 方向余弦不一致（给本组与基准的 6 分量、叉积法线；法线反向时 `opposite_direction=true`） |
+| `duplicate_projection` | 两个及以上实例的法线投影重合（`<= 1e-6 mm`，无法唯一排序，给出各匿名 SOP UID 及投影坐标） |
+| `invalid_geometry` | 几何标签缺失/无法解析/取值非法（缺标签时在 `missing_or_invalid_tags` 给出 `FrameOfReferenceUID` / `ImageOrientationPatient` / `ImagePositionPatient`；如零向量、非正交、分量越界、分量数不对） |
+| `ambiguous_output` | 同一匿名 SOP UID 对应多份物理输出（`output_files` 列出冲突文件） |
+| `unreadable` / `output_missing` | 匿名输出不可读，或任务记录有输出但磁盘文件已不存在 |
+
+> 说明：非影像对象（如 RTSTRUCT）没有几何标签时按 `invalid_geometry` 报出；
+> 多帧实例（`NumberOfFrames` 显式 `>1` 或取值非法）不属于“单帧实例”，
+> 不算冲突，只在成功响应的 `excluded_instances` 中列出。
+
+任务不存在 / 已过期返回 `404`（`JOB_NOT_FOUND`）；任务未完成返回 `409`
+（`JOB_NOT_READY`）；该匿名系列在任务的成功输出中不存在（含系列文件全部
+失败、无任何成功输出）返回 `404`（`SERIES_NOT_FOUND`）。系列有成功输出但
+**全部是多帧实例**、没有任何可分析的单帧实例时返回 `409`
+（`NO_SINGLE_FRAME_INSTANCES`，`problems[]` 列出被排除的多帧实例）。
+
+Python 示例（含 404/409 处理）：
+
+```python
+resp = requests.get(
+    f"http://localhost:8000/jobs/{job_id}/series/{anon_series_uid}/geometry"
+)
+if resp.status_code == 404:
+    print("任务或匿名系列不存在：", resp.json()["detail"]["code"])
+elif resp.status_code == 409:
+    detail = resp.json()["detail"]
+    if detail["code"] == "JOB_NOT_READY":
+        print("任务未完成：", detail["message"])
+    else:
+        print("几何冲突：", detail["code"])
+        for p in detail["problems"]:
+            # reason: frame_of_reference_mismatch | orientation_mismatch |
+            #         duplicate_projection | invalid_geometry |
+            #         ambiguous_output | unreadable | output_missing
+            print(p["reason"], p.get("sop_instance_uids") or p.get("sop_instance_uid"))
+else:
+    resp.raise_for_status()
+    g = resp.json()
+    if g["gap_check"] == "insufficient_slices":
+        print(g["message"])
+    else:
+        print("中位层间距：", g["median_spacing"], "mm")
+        print("异常间隙：",
+              [g["spacings"][i] for i in g["anomalous_gap_indices"]])
+```
 
 ### 跨任务合并下载同一匿名检查（`POST /jobs/merged-study/download`）
 
@@ -921,10 +1060,11 @@ else:
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集下载、实例 PNG 预览、/health）
+│   ├── main.py          # FastAPI 路由（/jobs、/jobs/consistency-check、/jobs/merged-study/download、全量/检查子集下载、系列几何、实例 PNG 预览、/health）
 │   ├── anonymizer.py    # 两遍扫描引擎：UID 映射、标签重写、递归序列、诊断、ZIP 打包
 │   ├── preview.py       # 按匿名 SOP UID 从成功输出渲染单帧 8 位灰度 PNG：Rescale→VOI 窗/极值拉伸→MONOCHROME1 反相
 │   ├── dicomdir.py      # 从匿名输出重建 DICOMDIR 四级层级、稳定短 File ID、引用校验与阅片 ZIP
+│   ├── geometry.py      # 系列单帧切片几何：方向余弦叉积法线、投影排序、中位数层间距与 >1.5× 缺口标记
 │   ├── study_subset.py  # 按匿名 StudyInstanceUID 的引用闭包解析与子集 ZIP（复用匿名输出）
 │   ├── merged_study.py  # 跨 2～5 个同密钥任务的检查合并：跨任务引用闭包、字节去重/冲突/缺失 409
 │   ├── consistency.py   # 跨任务一致性核对：密钥指纹/患者伪名/UID 映射比对与差异明细分页
@@ -932,9 +1072,9 @@ else:
 │   ├── crypto.py        # HMAC 确定性派生：伪名、UID、日期偏移
 │   ├── tags.py          # Annex E 标签策略与参与一致性重写的 UID 标签集合
 │   ├── jobs.py          # 任务存储、线程池处理、TTL 清理
-│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR/预览错误模型）
+│   ├── schemas.py       # 请求/响应模型（含一致性核对、分页、子集/合并/DICOMDIR/预览/几何错误模型）
 │   └── config.py        # 环境变量配置
-├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览（174 个用例）
+├── tests/               # pytest：加密派生 / 引擎 / API 端到端 / 一致性核对 / 分页游标 / 检查子集 / 跨任务合并 / DICOMDIR / PNG 预览 / 系列几何（209 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
